@@ -1,0 +1,2 @@
+This is the project init setup and also rough idea on why we are building this project, so
+We need data to solve robotic in physical world, we need more data that are very hard to simulte and it requires mroe compute to simulate these usecases, so in this opensouerce project we arw planngin to build is a headset to record and capture the workers move and work actions and then process this data to buid a industy specific data point to train the VLAs.
