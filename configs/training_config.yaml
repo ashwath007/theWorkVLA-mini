@@ -1,0 +1,25 @@
+model:
+  vision_backbone: mobilenet_v3_small
+  language_model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  action_dim: 7
+  hidden_dim: 512
+  num_heads: 8
+  dropout: 0.1
+
+training:
+  batch_size: 32
+  learning_rate: 3e-4
+  epochs: 50
+  warmup_steps: 500
+  grad_clip: 1.0
+  weight_decay: 0.01
+
+data:
+  image_size: 224
+  max_seq_len: 50
+  train_split: 0.8
+
+output:
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
+  save_every_n_epochs: 5
