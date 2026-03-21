@@ -48,6 +48,7 @@ class StreamSynchronizer:
         imu_csv_path: str,
         metadata_path: str,
         video_timestamps_csv: Optional[str] = None,
+        gps_csv_path: Optional[str] = None,
     ) -> Dict:
         """
         Align all streams and return a single dict ready for downstream processing.
@@ -65,13 +66,16 @@ class StreamSynchronizer:
         video_timestamps_csv : str, optional
             Path to video_timestamps.csv; if not provided, timestamps are
             reconstructed from metadata fps.
+        gps_csv_path : str, optional
+            Path to the recorded gps.csv (1 Hz). Interpolated to video fps.
 
         Returns
         -------
         dict with keys:
-            frames            : list of paths / indices (caller extracts)
+            frames            : list of frame indices
             audio_chunks      : np.ndarray  (T, samples_per_frame)  float32
             imu_readings      : np.ndarray  (T, 6)  float32  [ax,ay,az,gx,gy,gz]
+            gps_readings      : np.ndarray  (T, 6)  float32  [lat,lon,alt,speed,head_sin,head_cos]
             timestamps        : np.ndarray  (T,)    float64  Unix epoch
             frame_timestamps  : np.ndarray  (T,)    float64
             metadata          : dict
@@ -91,11 +95,15 @@ class StreamSynchronizer:
         # 3. Align IMU → per-frame IMU readings
         imu_readings = self._align_imu(imu_csv_path, frame_ts)
 
+        # 4. Align GPS → per-frame readings (optional)
+        gps_readings = self._align_gps(gps_csv_path, frame_ts)
+
         return {
-            "frames":           list(range(T)),          # frame indices
+            "frames":           list(range(T)),
             "video_path":       video_path,
             "audio_chunks":     audio_chunks,            # (T, samples)
             "imu_readings":     imu_readings,            # (T, 6)
+            "gps_readings":     gps_readings,            # (T, 6)
             "timestamps":       frame_ts,                # (T,)
             "frame_timestamps": frame_ts,
             "metadata":         metadata,
@@ -105,6 +113,60 @@ class StreamSynchronizer:
         }
 
     # ── Internal helpers ────────────────────────────────────────────────────────
+
+    def _align_gps(
+        self,
+        gps_csv_path: Optional[str],
+        frame_ts: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Interpolate 1 Hz GPS to video frame timestamps.
+
+        GPS columns used: lat, lon, alt, speed_kmh, heading_computed.
+        Returns (T, 6) float32: [lat, lon, alt, speed_kmh, heading_sin, heading_cos].
+        Returns zeros if GPS file not provided or unreadable.
+        """
+        T = len(frame_ts)
+        result = np.zeros((T, 6), dtype=np.float32)
+
+        if not gps_csv_path or not Path(gps_csv_path).exists():
+            return result
+
+        try:
+            df = pd.read_csv(gps_csv_path)
+        except Exception as exc:
+            logger.warning("Cannot read GPS CSV %s: %s", gps_csv_path, exc)
+            return result
+
+        if "timestamp" not in df.columns:
+            logger.warning("GPS CSV missing 'timestamp' column")
+            return result
+
+        gps_ts = df["timestamp"].to_numpy(dtype=np.float64)
+        col_map = {
+            0: "lat",
+            1: "lon",
+            2: "alt",
+            3: "speed_kmh",
+        }
+        for col_idx, col_name in col_map.items():
+            if col_name in df.columns:
+                result[:, col_idx] = np.interp(
+                    frame_ts, gps_ts, df[col_name].to_numpy(dtype=np.float64),
+                    left=df[col_name].iloc[0], right=df[col_name].iloc[-1],
+                ).astype(np.float32)
+
+        # Cyclic encoding for heading
+        heading_col = "heading_computed" if "heading_computed" in df.columns else "heading"
+        if heading_col in df.columns:
+            heading_rad = np.deg2rad(
+                np.interp(frame_ts, gps_ts, df[heading_col].to_numpy(dtype=np.float64))
+            )
+            result[:, 4] = np.sin(heading_rad).astype(np.float32)
+            result[:, 5] = np.cos(heading_rad).astype(np.float32)
+
+        logger.debug("GPS aligned: shape %s", result.shape)
+        return result
 
     def _load_metadata(self, metadata_path: str) -> dict:
         with open(metadata_path) as f:

@@ -59,6 +59,41 @@ apt-get install -y --no-install-recommends \
 
 success "System packages installed."
 
+# ── 2a. Enable UART for NEO-M8N GPS ──────────────────────────────────────────
+info "Enabling UART for GPS receiver …"
+
+_add_config_line() {
+    local file="$1"
+    local line="$2"
+    if [[ -f "$file" ]] && ! grep -q "^${line}" "$file"; then
+        echo "$line" >> "$file"
+        success "Added '$line' to $file"
+    fi
+}
+
+for CONFIG_FILE in /boot/config.txt /boot/firmware/config.txt; do
+    [[ -f "$CONFIG_FILE" ]] || continue
+    _add_config_line "$CONFIG_FILE" "enable_uart=1"
+    _add_config_line "$CONFIG_FILE" "dtoverlay=disable-bt"
+done
+
+# Disable the serial console so the GPS module can use /dev/ttyAMA0
+if grep -q "console=serial0" /boot/cmdline.txt 2>/dev/null; then
+    sed -i 's/console=serial0,[0-9]* //g' /boot/cmdline.txt
+    success "Removed serial console from /boot/cmdline.txt"
+fi
+if [[ -f /boot/firmware/cmdline.txt ]]; then
+    if grep -q "console=serial0" /boot/firmware/cmdline.txt; then
+        sed -i 's/console=serial0,[0-9]* //g' /boot/firmware/cmdline.txt
+        success "Removed serial console from /boot/firmware/cmdline.txt"
+    fi
+fi
+
+# Disable Bluetooth modem service (it occupies UART0 on Pi 3/4/5)
+systemctl disable hciuart 2>/dev/null || true
+systemctl stop    hciuart 2>/dev/null || true
+success "UART enabled for GPS (enable_uart=1, dtoverlay=disable-bt)."
+
 # ── 2. Enable I2C for MPU-9250 ────────────────────────────────────────────────
 info "Enabling I2C interface …"
 if grep -q "^#dtparam=i2c_arm=on" /boot/config.txt 2>/dev/null; then
@@ -99,6 +134,13 @@ pip install -r "$PROJECT_ROOT/requirements.txt"
 # RPi extras
 pip install smbus2 RPi.GPIO 2>/dev/null || warn "RPi.GPIO not installed (may need reboot)."
 
+# GPS serial support
+info "Installing GPS serial libraries …"
+pip install pyserial pynmea2 || warn "pyserial / pynmea2 installation failed."
+
+# HTTP upload client for ChunkStreamer
+pip install requests 2>/dev/null || warn "requests not installed."
+
 deactivate
 success "Python environment ready."
 
@@ -119,11 +161,13 @@ if [[ ! -f "$ENV_FILE" ]]; then
     success ".env file created from .env.example."
 fi
 
-# ── 6. systemd service ────────────────────────────────────────────────────────
-info "Installing systemd service …"
-SERVICE_FILE="/etc/systemd/system/vla-recorder.service"
+# ── 6. systemd services ───────────────────────────────────────────────────────
+info "Installing systemd services …"
 
-cat > "$SERVICE_FILE" << EOF
+# ── 6a. Recorder service ──────────────────────────────────────────────────────
+RECORDER_SERVICE_FILE="/etc/systemd/system/vla-recorder.service"
+
+cat > "$RECORDER_SERVICE_FILE" << EOF
 [Unit]
 Description=India VLA Headset Recorder
 After=network.target
@@ -144,9 +188,81 @@ StandardError=append:/var/log/vla/recorder.log
 WantedBy=multi-user.target
 EOF
 
+success "Recorder systemd service written: $RECORDER_SERVICE_FILE"
+
+# ── 6b. Streamer service ──────────────────────────────────────────────────────
+# The streamer watches the session directory and uploads chunks to the server.
+# Set VLA_SERVER_URL and VLA_API_KEY in /etc/default/vla-streamer or the .env file.
+
+STREAMER_SERVICE_FILE="/etc/systemd/system/vla-streamer.service"
+STREAMER_ENV_FILE="/etc/default/vla-streamer"
+
+# Write a defaults file if it doesn't exist
+if [[ ! -f "$STREAMER_ENV_FILE" ]]; then
+    cat > "$STREAMER_ENV_FILE" << 'ENVEOF'
+# VLA Chunk Streamer environment
+# Set these before starting the service.
+VLA_SERVER_URL=http://192.168.1.100:8000
+VLA_SESSION_ID=default-session
+VLA_DATA_DIR=/data/sessions
+VLA_API_KEY=
+VLA_DB_PATH=/tmp/vla_upload_queue.db
+ENVEOF
+    success "Streamer defaults written to $STREAMER_ENV_FILE"
+fi
+
+cat > "$STREAMER_SERVICE_FILE" << EOF
+[Unit]
+Description=India VLA Chunk Streamer
+Documentation=https://github.com/india-vla/india-vla-engine
+After=network-online.target
+Wants=network-online.target
+# Start after the recorder so the session directory exists
+After=vla-recorder.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+WorkingDirectory=$PROJECT_ROOT
+EnvironmentFile=$PROJECT_ROOT/.env
+EnvironmentFile=-$STREAMER_ENV_FILE
+ExecStart=$VENV_DIR/bin/python -c "
+import os, time, logging
+logging.basicConfig(level=logging.INFO)
+from src.capture.streamer import ChunkStreamer
+
+streamer = ChunkStreamer(
+    server_url=os.environ.get('VLA_SERVER_URL', 'http://localhost:8000'),
+    session_id=os.environ.get('VLA_SESSION_ID', 'default-session'),
+    data_dir=os.environ.get('VLA_DATA_DIR', '/data/sessions'),
+    api_key=os.environ.get('VLA_API_KEY') or None,
+    db_path=os.environ.get('VLA_DB_PATH', '/tmp/vla_upload_queue.db'),
+)
+streamer.start()
+
+try:
+    while True:
+        time.sleep(30)
+        stats = streamer.get_stats()
+        logging.info('Streamer stats: %s', stats)
+except KeyboardInterrupt:
+    pass
+finally:
+    streamer.stop()
+"
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/vla/streamer.log
+StandardError=append:/var/log/vla/streamer.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable vla-recorder.service
-success "systemd service installed and enabled."
+systemctl enable vla-streamer.service
+success "Recorder and Streamer systemd services installed and enabled."
 
 # ── 7. Log rotation ───────────────────────────────────────────────────────────
 cat > /etc/logrotate.d/vla-recorder << 'EOF'
@@ -172,14 +288,20 @@ echo -e "${GREEN}============================================================${N
 echo ""
 echo "  Data directory : $DATA_DIR"
 echo "  Virtual env    : $VENV_DIR"
-echo "  Service        : vla-recorder.service"
+echo "  Services       : vla-recorder.service  vla-streamer.service"
 echo ""
 echo "  To start recording:"
 echo "    sudo systemctl start vla-recorder"
+echo ""
+echo "  To start the chunk uploader:"
+echo "    sudo systemctl start vla-streamer"
+echo ""
+echo "  Configure the server URL before starting the streamer:"
+echo "    sudo nano $STREAMER_ENV_FILE"
 echo ""
 echo "  Or manually:"
 echo "    source $VENV_DIR/bin/activate"
 echo "    vla-record record --duration 3600"
 echo ""
-warn "A REBOOT is required to activate I2C interface."
+warn "A REBOOT is required to activate I2C and UART interfaces."
 echo ""

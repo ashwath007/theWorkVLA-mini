@@ -62,6 +62,7 @@ class HDF5Writer:
         actions: Optional[np.ndarray] = None,
         timestamps: Optional[np.ndarray] = None,
         episode_index: int = 0,
+        gps_data: Optional[np.ndarray] = None,
     ) -> str:
         """
         Write a complete session to HDF5.
@@ -113,6 +114,12 @@ class HDF5Writer:
 
             obs_grp.create_dataset("audio",  data=audio_chunks.astype(np.float32), **kw)
             obs_grp.create_dataset("imu",    data=imu_data.astype(np.float32),     **kw)
+
+            # GPS embedding: (T, 6) [lat_norm, lon_norm, alt_norm, speed_norm, head_sin, head_cos]
+            if gps_data is not None:
+                obs_grp.create_dataset("gps", data=gps_data.astype(np.float32), **kw)
+            else:
+                obs_grp.create_dataset("gps", data=np.zeros((len(frames), 6), dtype=np.float32), **kw)
 
             # ── Actions ─────────────────────────────────────────────────────────
             f.create_dataset("action", data=actions.astype(np.float32), **kw)

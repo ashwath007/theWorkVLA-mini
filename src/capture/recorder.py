@@ -26,6 +26,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ── GPS backend detection ──────────────────────────────────────────────────────
+try:
+    from .streamer import GPSReader, GPSFix  # type: ignore
+    _HAS_GPS_READER = True
+except ImportError:
+    _HAS_GPS_READER = False
+    GPSReader = None  # type: ignore[assignment,misc]
+
 # ── IMU backend detection ──────────────────────────────────────────────────────
 _HAS_SMBUS = False
 try:
@@ -95,6 +103,10 @@ class HeadsetRecorder:
         imu_hz: int = 100,
         autosave_interval_sec: int = 300,
         simulate_imu: Optional[bool] = None,
+        gps_enabled: bool = True,
+        gps_port: str = "/dev/ttyAMA0",
+        gps_baud: int = 9600,
+        simulate_gps: Optional[bool] = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.video_device = video_device
@@ -109,6 +121,13 @@ class HeadsetRecorder:
 
         # If not specified, simulate on non-RPi platforms
         self.simulate_imu = simulate_imu if simulate_imu is not None else (not _HAS_SMBUS)
+
+        # GPS settings
+        self.gps_enabled = gps_enabled and _HAS_GPS_READER
+        self.gps_port    = gps_port
+        self.gps_baud    = gps_baud
+        # Simulate GPS if no serial device is found and simulate not forced off
+        self.simulate_gps = simulate_gps if simulate_gps is not None else (not _HAS_GPS_READER)
 
         # Internal state
         self._recording = False
@@ -126,6 +145,9 @@ class HeadsetRecorder:
         # Buffers (filled by threads, flushed on stop / autosave)
         self._imu_samples: List[IMUSample] = []
         self._imu_lock = threading.Lock()
+
+        # GPS reader instance (created at start() time)
+        self._gps_reader: Optional[object] = None  # GPSReader when available
 
         # Frame / audio counters (for stats)
         self._video_frame_count = 0
@@ -161,6 +183,20 @@ class HeadsetRecorder:
         self._imu_thread.start()
         self._autosave_thread.start()
 
+        # GPS reader — start alongside other streams
+        if self.gps_enabled and GPSReader is not None:
+            self._gps_reader = GPSReader(
+                port=self.gps_port,
+                baud=self.gps_baud,
+                simulate=self.simulate_gps,
+            )
+            self._gps_reader.start()
+            logger.info("GPSReader started (simulate=%s)", self.simulate_gps)
+        else:
+            if self.gps_enabled and GPSReader is None:
+                logger.warning("GPS enabled but GPSReader not available (streamer.py missing?)")
+            self._gps_reader = None
+
         return self._session_id
 
     def stop(self) -> SessionMetadata:
@@ -176,6 +212,13 @@ class HeadsetRecorder:
         for t in (self._video_thread, self._audio_thread, self._imu_thread, self._autosave_thread):
             if t and t.is_alive():
                 t.join(timeout=10)
+
+        # Stop GPS reader
+        if self._gps_reader is not None:
+            try:
+                self._gps_reader.stop()
+            except Exception as exc:
+                logger.warning("Error stopping GPSReader: %s", exc)
 
         # Flush remaining IMU buffer
         self._flush_imu()
@@ -197,13 +240,27 @@ class HeadsetRecorder:
     def stats(self) -> dict:
         """Live stats for display."""
         elapsed = time.time() - self._start_time if self._start_time else 0
+        gps_fix = None
+        if self._gps_reader is not None:
+            try:
+                fix = self._gps_reader.get_latest_fix()
+                if fix is not None:
+                    gps_fix = {"lat": fix.lat, "lon": fix.lon, "fix_quality": fix.fix_quality}
+            except Exception:
+                pass
         return {
-            "session_id": self._session_id,
-            "elapsed_sec": round(elapsed, 1),
-            "video_frames": self._video_frame_count,
+            "session_id":    self._session_id,
+            "elapsed_sec":   round(elapsed, 1),
+            "video_frames":  self._video_frame_count,
             "audio_samples": self._audio_sample_count,
-            "imu_samples": len(self._imu_samples),
+            "imu_samples":   len(self._imu_samples),
+            "gps_fix":       gps_fix,
         }
+
+    @property
+    def gps_reader(self) -> Optional[object]:
+        """Return the active GPSReader instance, or None if GPS is disabled."""
+        return self._gps_reader
 
     # ── Path helpers ────────────────────────────────────────────────────────────
 
